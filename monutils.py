@@ -1269,6 +1269,12 @@ def make_tunnels(tunnels, mon_local):
 
 def generate_plots(execs,
                    plot_list=('cpu_bars', 'gpu_bars', 'user_total_memusage')):
+    monitor_methods = list()
+    if any('gpu' in pltname for pltname in plot_list):
+        monitor_methods.append('gpus_mon')
+    if any('cpu' in pltname for pltname in plot_list):
+        monitor_methods.append('cpus_mon')
+
     _hplots = list()
     panels = list()
     monitors = list()
@@ -1283,9 +1289,12 @@ def generate_plots(execs,
         hostname = ex[1](['hostname'], stdout=PIPE).communicate()[0].decode().strip('\r\n ')
         panels.append(Panel(title=hostname, child=plt))
         _hplots.append(plt)
-        monitors.append(mon)
+        for mon_method in monitor_methods:
+            monitors.append(getattr(mon, mon_method))
+
         change_streams.append(changes)
     tabs = Tabs(tabs=panels)
+
     return hplot(tabs), monitors, change_streams
 
 
@@ -1311,8 +1320,7 @@ def notebook(*tunnels, mon_local=True, plot_list: Sequence = None):
     show(plots)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(asyncio.gather(
-        *(mon.gpus_mon(loop=loop) for mon in monitors),
-        *(mon.cpus_mon() for mon in monitors),
+        *(mon() for mon in monitors),
         *(changes.start() for changes in change_streams)
     ))
 
@@ -1320,7 +1328,7 @@ def notebook(*tunnels, mon_local=True, plot_list: Sequence = None):
 def standalone(*tunnels, plots=None, remote_only=False, bokeh_port=5006,
                mon_port=8080):
     execs = make_tunnels(tunnels, (not remote_only))
-    plot_args = {'plot_list': args.plots} if plots else dict()
+    plot_args = {'plot_list': plots} if plots else dict()
     plots, monitors, change_streams = generate_plots(execs, **plot_args)
 
     p_bokeh, session = start_bokeh(mon_port, bokeh_port, change_streams)
@@ -1339,8 +1347,7 @@ def standalone(*tunnels, plots=None, remote_only=False, bokeh_port=5006,
         loop = asyncio.get_event_loop()
         start_tornado(loop, bokeh_port, mon_port, scr)
         loop.run_until_complete(asyncio.gather(
-            *(mon.gpus_mon(loop=loop) for mon in monitors),
-            *(mon.cpus_mon() for mon in monitors),
+            *(mon() for mon in monitors),
             *(changes.start() for changes in change_streams)
         ))
     finally:
