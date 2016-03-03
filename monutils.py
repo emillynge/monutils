@@ -373,7 +373,9 @@ class ChangeStream(asyncio.Queue):
                     dead_waiters = list()
                     for waiter in waiters:
                         try:
-                            waiter.send(change)
+                            source = waiter.send(change)
+                            if source:
+                                self.source_fun(source)
                         except StopIteration:
                             dead_waiters.append(waiter)
                     for waiter in dead_waiters:
@@ -780,7 +782,11 @@ class RessourceMonitor:
     def cpus(subproc_exec=Popen):
         p = subproc_exec(['top', '-n2', '-b', '-p0'], stdout=PIPE, stderr=FNULL)
         data = p.stdout.read()
-        return lines2CPUs(data.decode())
+        devices = set()
+        for cpu in reversed(lines2CPUs(data.decode())):
+            if cpu.dev not in devices:
+                yield cpu
+                devices.add(cpu.dev)
 
     @staticmethod
     async def cpus_coro(subproc_exec=async_subprocess):
@@ -888,6 +894,7 @@ class BokehPlots:
     def cpu_bars(self, vertical=False, **kwargs):
         cpus = sorted(RessourceMonitor.cpus(subproc_exec=self.normal_exec),
                       key=itemgetter(0))
+
         devices, loads = tuple(zip(*cpus))
         source = ColumnDataSource(self._bar_source(devices, ('load', loads)))
 
