@@ -26,8 +26,7 @@ output_notebook()
 
 gpumon.notebook("myuser@host1", "-p 5900 myuser@locahost", mon_local=False)
 ```
-Remember to either have ssh keys for logging in prepared. atm there is no way 
-to provide cleartext passwords (and frankly this might be a good thing)
+
 
 ## Parameters
 Both implementations use these parameters
@@ -37,7 +36,10 @@ ssh arguments used for logging into remote machines
 Example:
     "-p 5900 myuser@somehost" -> log in using port 5900 with "mysuser" on "somehost"
 For every ssh string a monitor column will be added to the interface
-    
+
+Remember to either have ssh keys for logging in prepared. atm there is no way 
+to provide cleartext passwords (and frankly this might be a good thing)
+Also make sure that the hosts are added to trusted hosts
 ### mon_local / remote-only
 should the local machine be monitored?
 

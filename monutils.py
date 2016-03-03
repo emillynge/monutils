@@ -31,7 +31,8 @@ except AssertionError:
     warnings.warn('Could not swap out tornado AIO-loop. Bokeh will not '
                   'be able to run on the main loop')
 
-from bokeh.models import ColumnDataSource, Range1d, FactorRange, HoverTool
+from bokeh.models import (ColumnDataSource, Range1d, FactorRange, HoverTool,
+                          Markup, Paragraph, Panel, Tabs)
 from bokeh.plotting import figure, hplot, vplot
 from bokeh.client import push_session
 from bokeh.io import curdoc, curstate
@@ -791,13 +792,15 @@ class RessourceMonitor:
 
     @staticmethod
     def find_pid_owner(*pids, subproc_exec=Popen):
+        if not pids:
+            return list()
         pids = list(str(pid) for pid in pids)
         pid_cs = ','.join(pids)
         p = subproc_exec(['ps', '-p', pid_cs, '-o', 'pid,user', 'h'],
                          stdout=PIPE,
                          stderr=PIPE)
         data, err = p.communicate()
-        if err:
+        if err and not re.match(b'^Connection to localhost closed.\r?\n$', err):
             raise IOError(err)
         pid2owner = dict(re.findall('\W*(\d+) (\w+)', data.decode()))
         return [pid2owner.get(pid, None) for pid in pids]
@@ -811,7 +814,7 @@ class RessourceMonitor:
                                stderr=PIPE)
 
         data, err = await p.communicate()
-        if err:
+        if err and not re.match(b'^Connection to localhost closed.\r?\n$', err):
             raise IOError(err)
         pid2owner = dict(re.findall('\W*(\d+) (\w+)', data.decode()))
         return [pid2owner.get(pid, None) for pid in pids]
@@ -822,7 +825,7 @@ class RessourceMonitor:
                          stdout=PIPE,
                          stderr=PIPE)
         data, err = p.communicate()
-        if err:
+        if err and not re.match(b'^Connection to localhost closed.\r?\n$', err):
             raise IOError(err)
         pid2owner = dict((int(pid), owner) for pid, owner in
                          re.findall('\W*(\d+) (\w+)', data.decode()))
@@ -834,7 +837,7 @@ class RessourceMonitor:
                                stdout=PIPE,
                                stderr=PIPE)
         data, err = await p.communicate()
-        if err:
+        if err and not re.match(b'^Connection to localhost closed.\r?\n$', err):
             raise IOError(err)
         pid2owner = dict((int(pid), owner) for pid, owner in
                          re.findall('\W*(\d+) (\w+)', data.decode()))
@@ -878,6 +881,9 @@ class BokehPlots:
         kwargs['x_axis_label'], kwargs['y_axis_label'] = kwargs['y_axis_label'], \
                                                          kwargs[
                                                              'x_axis_label']
+
+    def title(self, title_text):
+        return Paragraph(text='</p><h1>{}</h1><p>'.format(title_text))
 
     def cpu_bars(self, vertical=False, **kwargs):
         cpus = sorted(RessourceMonitor.cpus(subproc_exec=self.normal_exec),
@@ -981,7 +987,7 @@ class BokehPlots:
 
         source = ColumnDataSource(user2data(users))
 
-        val_range = Range1d(0, max(source.data['memusage']) * 1.5)
+        val_range = Range1d(0, max(source.data['memusage'] + [0]) * 1.5)
         name_range = FactorRange(factors=source.data['name'])
         kwargs['x_range'] = name_range
         kwargs['y_range'] = val_range
@@ -1108,8 +1114,8 @@ class BokehPlots:
     def serve(host='localhost', port=5006, session_id='test'):
         url = 'http://' + host + ':' + str(port) + '/'
         session = push_session(curdoc(),
-                                    session_id=session_id,
-                                    url=url)
+                               session_id=session_id,
+                               url=url)
         session.show()
         return session
 
@@ -1118,10 +1124,12 @@ class BokehPlots:
         curstate().reset()
 
 
-def start_bokeh(mon_port, bokeh_port, changes: ChangeStream):
+def start_bokeh(mon_port, bokeh_port, changes: List[ChangeStream]):
     loop = asyncio.get_event_loop()
+
     async def test():
-        await changes.put(Command('test', None, None))
+        for stream in changes:
+            await stream.put(Command('test', None, None))
 
     async def do_start():
         p_bokeh = await async_subprocess('bokeh', 'serve', '--port',
@@ -1144,8 +1152,9 @@ def start_bokeh(mon_port, bokeh_port, changes: ChangeStream):
     try:
         s = BokehPlots.serve(port=bokeh_port, session_id='monitor')
         loop.run_until_complete(test())
+        return None, s
     except OSError:
-        return loop.run_until_complete(do_start()), s
+        return loop.run_until_complete(do_start())
 
 
 def start_tornado(loop, bokeh_port, mon_port, scr):
@@ -1251,29 +1260,36 @@ def make_tunnels(tunnels, mon_local):
     # Test the tunnels
     for tun_name, (async_ex, ex) in execs.items():
         out, err = ex(['echo', 'hello world'], stdout=PIPE,
-                    stderr=PIPE).communicate()
+                      stderr=PIPE).communicate()
         if not re.match(b'^hello world\r?\n$', out):
             raise ValueError('tunnel {} does not seem to work'
                              ':\n\t{}'.format(out.decode(), err.decode()))
     return execs
 
 
-def generate_plots(execs, plot_list=('cpu_bars', 'gpu_bars', 'user_total_memusage')):
+def generate_plots(execs,
+                   plot_list=('cpu_bars', 'gpu_bars', 'user_total_memusage')):
     _hplots = list()
+    panels = list()
     monitors = list()
     change_streams = list()
-    for ex in execs.values():
+    for name, ex in execs.items():
         changes = ChangeStream(source_fun=update_notebook_source)
         mon = RessourceMonitor(changes, async_exec=ex[0], normal_exec=ex[1])
         plot_gen = BokehPlots(changes, async_exec=ex[0], normal_exec=ex[1])
-        _hplots.append(vplot(getattr(plot_gen, plt).__call__()
-                             for plt in plot_list))
+        plt = vplot(*[getattr(plot_gen, plt).__call__()
+                      for plt in plot_list])
+
+        hostname = ex[1](['hostname'], stdout=PIPE).communicate()[0].decode().strip('\r\n ')
+        panels.append(Panel(title=hostname, child=plt))
+        _hplots.append(plt)
         monitors.append(mon)
         change_streams.append(changes)
-    return hplot(*_hplots), monitors, change_streams
+    tabs = Tabs(tabs=panels)
+    return hplot(tabs), monitors, change_streams
 
 
-def notebook(*tunnels, mon_local=True, plot_list: Sequence=None):
+def notebook(*tunnels, mon_local=True, plot_list: Sequence = None):
     """
     Output monitor to a notebook
     This command will block the notebook until interrupted
@@ -1303,25 +1319,32 @@ def notebook(*tunnels, mon_local=True, plot_list: Sequence=None):
 
 def standalone(*tunnels, plots=None, remote_only=False, bokeh_port=5006,
                mon_port=8080):
-
     execs = make_tunnels(tunnels, (not remote_only))
     plot_args = {'plot_list': args.plots} if plots else dict()
     plots, monitors, change_streams = generate_plots(execs, **plot_args)
 
-    session, p_bokeh = start_bokeh(mon_port, bokeh_port, change_streams)
+    p_bokeh, session = start_bokeh(mon_port, bokeh_port, change_streams)
 
-    scr = autoload_server(plots, session_id=session.id)
-    print(scr)
-    scr = re.sub('http://localhost:{0}'.format(bokeh_port), '', scr)
-    scr = TEMPLATE.format(script=scr).encode()
+    def kill_bokeh():
+        if isinstance(p_bokeh, Popen):
+            p_bokeh.terminate()
 
-    loop = asyncio.get_event_loop()
-    start_tornado(loop, bokeh_port, mon_port, scr)
-    loop.run_until_complete(asyncio.gather(
-        *(mon.gpus_mon(loop=loop) for mon in monitors),
-        *(mon.cpus_mon() for mon in monitors),
-        *(changes.start() for changes in change_streams)
-    ))
+    try:
+        print(session.id)
+        scr = autoload_server(plots, session_id=session.id)
+        print(scr)
+        scr = re.sub('http://localhost:{0}'.format(bokeh_port), '', scr)
+        scr = TEMPLATE.format(script=scr).encode()
+
+        loop = asyncio.get_event_loop()
+        start_tornado(loop, bokeh_port, mon_port, scr)
+        loop.run_until_complete(asyncio.gather(
+            *(mon.gpus_mon(loop=loop) for mon in monitors),
+            *(mon.cpus_mon() for mon in monitors),
+            *(changes.start() for changes in change_streams)
+        ))
+    finally:
+        kill_bokeh()
 
 
 if __name__ == "__main__":
@@ -1347,5 +1370,5 @@ if __name__ == "__main__":
                         help='specify specific plots in stead of defaults')
 
     args = parser.parse_args()
-    standalone(args.tunnels, plots=args.plots, remote_only=args.remote_only,
+    standalone(*args.tunnels, plots=args.plots, remote_only=args.remote_only,
                bokeh_port=args.bp, mon_port=args.mp)
