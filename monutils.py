@@ -14,7 +14,7 @@ from collections import (namedtuple, deque, defaultdict,
                          MutableSequence, OrderedDict)
 from operator import itemgetter
 from subprocess import (Popen, PIPE)
-from typing import List
+from typing import List, Sequence
 import logging
 
 import time
@@ -879,7 +879,7 @@ class BokehPlots:
                                                          kwargs[
                                                              'x_axis_label']
 
-    def cpu_bars(self, vertical=True, **kwargs):
+    def cpu_bars(self, vertical=False, **kwargs):
         cpus = sorted(RessourceMonitor.cpus(subproc_exec=self.normal_exec),
                       key=itemgetter(0))
         devices, loads = tuple(zip(*cpus))
@@ -1104,22 +1104,22 @@ class BokehPlots:
 
         return p
 
-    def serve(self, host='localhost', port=5006, session_id='test'):
+    @staticmethod
+    def serve(host='localhost', port=5006, session_id='test'):
         url = 'http://' + host + ':' + str(port) + '/'
-        self.session = push_session(curdoc(),
+        session = push_session(curdoc(),
                                     session_id=session_id,
                                     url=url)
-        self.session.show()
+        session.show()
+        return session
 
     def revive(self):
         self.terminated = False
         curstate().reset()
 
 
-def start_bokeh(mon_port, bokeh_port, plot_gen: BokehPlots,
-                changes: ChangeStream):
+def start_bokeh(mon_port, bokeh_port, changes: ChangeStream):
     loop = asyncio.get_event_loop()
-
     async def test():
         await changes.put(Command('test', None, None))
 
@@ -1137,15 +1137,15 @@ def start_bokeh(mon_port, bokeh_port, plot_gen: BokehPlots,
             if b'clients connected' in line:
                 print('breaking')
                 break
-        plot_gen.serve(port=bokeh_port, session_id='monitor')
+        s = BokehPlots.serve(port=bokeh_port, session_id='monitor')
         await test()
-        return p_bokeh
+        return p_bokeh, s
 
     try:
-        plot_gen.serve(port=bokeh_port, session_id='monitor')
+        s = BokehPlots.serve(port=bokeh_port, session_id='monitor')
         loop.run_until_complete(test())
     except OSError:
-        return loop.run_until_complete(do_start())
+        return loop.run_until_complete(do_start()), s
 
 
 def start_tornado(loop, bokeh_port, mon_port, scr):
@@ -1258,20 +1258,7 @@ def make_tunnels(tunnels, mon_local):
     return execs
 
 
-def notebook(*tunnels, mon_local=True):
-    """
-    Output monitor to a notebook
-    This command will block the notebook until interrupted
-    :param tunnels: string of ssh arguments used for logging into remote machines
-        Example:
-            "-p 5900 myuser@somehost" -> log in using port 5900 with "mysuser" on "somehost"
-        For every ssh string a monitor column will be added to the interface
-    :param mon_local: bool, should the local machine be monitored?
-    :return:
-    """
-    from bokeh.io import show
-    execs = make_tunnels(tunnels, mon_local)
-
+def generate_plots(execs, plot_list=('cpu_bars', 'gpu_bars', 'user_total_memusage')):
     _hplots = list()
     monitors = list()
     change_streams = list()
@@ -1279,13 +1266,57 @@ def notebook(*tunnels, mon_local=True):
         changes = ChangeStream(source_fun=update_notebook_source)
         mon = RessourceMonitor(changes, async_exec=ex[0], normal_exec=ex[1])
         plot_gen = BokehPlots(changes, async_exec=ex[0], normal_exec=ex[1])
-        _hplots.append(vplot(plot_gen.cpu_bars(False), plot_gen.gpu_bars(),
-                             plot_gen.user_total_memusage()))
+        _hplots.append(vplot(getattr(plot_gen, plt).__call__()
+                             for plt in plot_list))
         monitors.append(mon)
         change_streams.append(changes)
-    plots = hplot(*_hplots)
+    return hplot(*_hplots), monitors, change_streams
+
+
+def notebook(*tunnels, mon_local=True, plot_list: Sequence=None):
+    """
+    Output monitor to a notebook
+    This command will block the notebook until interrupted
+    :param tunnels: strings
+        ssh arguments used for logging into remote machines
+        Example:
+            "-p 5900 myuser@somehost" -> log in using port 5900 with "mysuser" on "somehost"
+        For every ssh string a monitor column will be added to the interface
+    :param mon_local: bool
+        should the local machine be monitored?
+    :param plot_list: Sequence of strings or None
+        if not None, it overrides the default plots. use methods names of
+        BokehPlots class
+    :return: None
+    """
+    from bokeh.io import show
+    execs = make_tunnels(tunnels, mon_local)
+    plots = monitors, change_streams = generate_plots(execs)
     show(plots)
     loop = asyncio.get_event_loop()
+    loop.run_until_complete(asyncio.gather(
+        *(mon.gpus_mon(loop=loop) for mon in monitors),
+        *(mon.cpus_mon() for mon in monitors),
+        *(changes.start() for changes in change_streams)
+    ))
+
+
+def standalone(*tunnels, plots=None, remote_only=False, bokeh_port=5006,
+               mon_port=8080):
+
+    execs = make_tunnels(tunnels, (not remote_only))
+    plot_args = {'plot_list': args.plots} if plots else dict()
+    plots, monitors, change_streams = generate_plots(execs, **plot_args)
+
+    session, p_bokeh = start_bokeh(mon_port, bokeh_port, change_streams)
+
+    scr = autoload_server(plots, session_id=session.id)
+    print(scr)
+    scr = re.sub('http://localhost:{0}'.format(bokeh_port), '', scr)
+    scr = TEMPLATE.format(script=scr).encode()
+
+    loop = asyncio.get_event_loop()
+    start_tornado(loop, bokeh_port, mon_port, scr)
     loop.run_until_complete(asyncio.gather(
         *(mon.gpus_mon(loop=loop) for mon in monitors),
         *(mon.cpus_mon() for mon in monitors),
@@ -1302,47 +1333,19 @@ if __name__ == "__main__":
     parser.add_argument('-m', '--monitor-port', type=int, default=8080,
                         dest='mp', help='the port the monitor will serve '
                                         'the web interface on')
+    parser.add_argument('-r', '--remote-only', action='store_true',
+                        help='if specified, only hosts specifiend in --tunnels'
+                             'will be monitored. Else this machine is also'
+                             'monitored')
+
     parser.add_argument('-t', '--tunnels', type=str, default=None, nargs='*',
                         help='specify tunnels to monitored hosts.'
                              'for special args encapsulate args to ssh with ""'
                              'If not specified just monitor this machine')
+
+    parser.add_argument('-p', '--plots', type=str, default=None, nargs='*',
+                        help='specify specific plots in stead of defaults')
+
     args = parser.parse_args()
-    execs = dict()
-    if args.tunnels:
-        for tunnel in args.tunnels:
-            t_args = re.findall('([\'"]([^"\']+)["\'])|([^ ]+)', tunnel)
-            t_args = [a[-1] if a[-1] else a[-1] for a in t_args]
-            t_args = [a.strip(' ') for a in t_args]
-            execs['_'.join(t_args)] = make_ssh_subprocess(*t_args)
-    else:
-        execs['localhost'] = async_subprocess, Popen
-
-    _hplots = list()
-    monitors = list()
-    change_streams = list()
-    for ex in execs.values():
-        changes = ChangeStream()
-        mon = RessourceMonitor(changes, async_exec=ex[0], normal_exec=ex[1])
-        plot_gen = BokehPlots(changes, async_exec=ex[0], normal_exec=ex[1])
-        _hplots.append(vplot(plot_gen.cpu_bars(False), plot_gen.gpu_bars(),
-                             plot_gen.user_total_memusage()))
-        monitors.append(mon)
-        change_streams.append(changes)
-
-    plots = hplot(*_hplots)
-    bokeh_port = args.bp
-    mon_port = args.mp
-    p_bokeh = start_bokeh(mon_port, bokeh_port, plot_gen, changes)
-
-    scr = autoload_server(plots, session_id=plot_gen.session.id)
-    print(scr)
-    scr = re.sub('http://localhost:{0}'.format(bokeh_port), '', scr)
-    scr = TEMPLATE.format(script=scr).encode()
-
-    loop = asyncio.get_event_loop()
-    start_tornado(loop, bokeh_port, mon_port, scr)
-    loop.run_until_complete(asyncio.gather(
-        *(mon.gpus_mon(loop=loop) for mon in monitors),
-        *(mon.cpus_mon() for mon in monitors),
-        *(changes.start() for changes in change_streams)
-    ))
+    standalone(args.tunnels, plots=args.plots, remote_only=args.remote_only,
+               bokeh_port=args.bp, mon_port=args.mp)
